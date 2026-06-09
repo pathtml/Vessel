@@ -1,122 +1,232 @@
 # Ai Usage Dock
 
-A local Windows Tauri + React system-tray app for tracking remaining AI subscription usage.
+Ai Usage Dock is a small Windows tray app for tracking remaining usage across AI tools such as ChatGPT Codex, Claude, Gemini, Perplexity, Cursor, GitHub Copilot, and custom providers.
 
-## Product Rules
+Current version: `0.1.1`
 
-- Tracks one active provider in the tray at a time.
-- Default tray display period is `5h`.
-- Supports provider periods: `5h`, `daily`, `weekly`, `monthly`, and `custom`.
-- Does not scrape provider pages, read browser cookies, ask for passwords, automate login, or fake official usage.
-- If official or local supported status sync is unavailable, show manual setup and label the data as manual.
-- If no limit is configured, the tray stays neutral and the UI asks the user to set a limit.
+## What It Does
 
-## Source Badges
+- Shows one active provider in the Windows system tray.
+- Displays remaining usage as a colored tray icon.
+- Opens a compact dashboard from the tray.
+- Tracks `5h`, daily, weekly, monthly, and custom reset windows.
+- Supports manual usage tracking for providers without supported quota data.
+- Supports local sync for selected tools when a supported local source exists.
+- Sends optional low-usage notifications.
+- Stores usage data locally.
 
-- `Official`: usage comes from a documented official API or supported local status source. This MVP does not enable this badge by default.
-- `Local`: usage comes from a supported local provider session or export, such as Codex CLI auth or Claude Code status-line data.
-- `Manual`: the user manually sets limit and used amount.
-- `Estimated`: usage is estimated only from activity this app can see.
-- `Unsupported`: official usage is unavailable and tracking is not configured.
+## Privacy And Safety
 
-## What Works
+Ai Usage Dock is intentionally local-first.
 
-- Quiet Tauri tray app startup with the dashboard hidden by default.
-- Native tray menu: Open Dashboard, Add Usage, Reset Current Period, Settings, Quit.
-- Active-provider tray display with colored percentage icon fallback.
-- First-time setup walkthrough for ChatGPT, ChatGPT Codex, Claude, Gemini, Perplexity, Cursor, GitHub Copilot, OpenAI API, Claude API, and Custom.
-- ChatGPT Codex can sync 5h and weekly usage from the existing local Codex CLI login.
-- Claude Code can sync 5h and weekly usage from its official local status-line payload after the included setup script is installed.
-- Gemini can sync from a local Gemini CLI quota export file when quota bucket data is available.
-- Other built-in providers default to manual setup because no consumer subscription quota source is officially supported in this build.
-- Manual 5h and weekly setup presets.
-- Multiple periods per provider with independent reset routines.
-- Reset display formatter using native `Intl.DateTimeFormat`.
-- Tooltip settings for selected periods, percentage, remaining amount, next reset, source type, and last updated.
-- Manual usage entry per provider and period.
-- Local SQLite storage in Tauri desktop mode.
-- Browser development fallback through localStorage for non-secret usage/settings only.
-- API credential commands routed to OS secure storage in Tauri mode.
-- Codex usage sync reads `CODEX_HOME\auth.json` or `%USERPROFILE%\.codex\auth.json` inside the Tauri backend, calls the ChatGPT Codex usage endpoint, and never stores the token in Ai Usage Dock.
-- Claude Code sync reads only `%USERPROFILE%\.ai-usage-dock\claude-code-usage.json`, a sanitized file written by the included status-line script.
-- Gemini sync reads only `%USERPROFILE%\.ai-usage-dock\gemini-cli-usage.json`, a sanitized quota export file.
+It does not:
 
-## Local Provider Sync Setup
+- Scrape provider websites.
+- Read browser cookies.
+- Ask for ChatGPT, Claude, Gemini, or other account passwords.
+- Automate web login.
+- Send your local usage data to a cloud backend.
+- Pretend manual or estimated data is official.
 
-Codex works automatically after `codex login` because Ai Usage Dock reuses the local Codex CLI auth file inside the native backend.
+If a provider does not expose official or supported local usage data, the app falls back to manual setup.
 
-Claude Code requires the official status-line hook:
+## Usage Sources
+
+The app labels every provider period by source:
+
+- `Local`: synced from a supported local app/session/export.
+- `Manual`: entered and maintained by you.
+- `Estimated`: calculated from activity the app can see.
+- `Official`: reserved for documented provider APIs.
+- `Unsupported`: no supported source is configured.
+
+In `0.1.1`, consumer subscription usage is mostly local or manual. This is deliberate: the app avoids unsafe scraping and credential collection.
+
+## Supported Provider Status
+
+| Provider | Status in 0.1.1 | Notes |
+| --- | --- | --- |
+| ChatGPT Codex | Local sync | Uses your existing Codex CLI login from `CODEX_HOME\auth.json` or `%USERPROFILE%\.codex\auth.json`. |
+| Claude Code | Local sync after setup | Uses Claude Code's official status-line payload and writes a sanitized local export. |
+| Gemini | Local export reader | Reads a sanitized Gemini quota export when available. Manual setup is recommended if quota data is unavailable. |
+| ChatGPT web | Manual | Consumer web quota is not exposed through a supported public API in this build. |
+| Perplexity | Manual | No supported consumer quota source is configured. |
+| Cursor | Manual | No supported consumer quota source is configured. |
+| GitHub Copilot | Manual | No supported consumer quota source is configured. |
+| OpenAI API | Manual | API usage is not the same as ChatGPT/Codex subscription quota. |
+| Claude API | Manual | Admin usage APIs are not the same as Claude Pro/Max subscription quota. |
+| Custom | Manual | User-defined provider and limits. |
+
+## Install
+
+Download the Windows MSI from the release page:
+
+```text
+Ai Usage Dock_0.1.1_x64_en-US.msi
+```
+
+Run the installer and launch Ai Usage Dock from the Start Menu or installed app location.
+
+Early public builds may show a Windows SmartScreen or unknown publisher warning if the installer is not code-signed yet.
+
+## First Run
+
+1. Open Ai Usage Dock.
+2. Choose a provider.
+3. Select the period you want in the tray, usually `5h`.
+4. Enter limits manually, or use a local sync provider.
+5. Keep the app running in the tray.
+
+Tray menu actions:
+
+- Open Dashboard
+- Add manual usage
+- Reset Current Period
+- Settings
+- Quit
+
+## Local Sync Setup
+
+### ChatGPT Codex
+
+Codex sync works after you have signed in with the Codex CLI.
+
+Ai Usage Dock reads:
+
+```text
+CODEX_HOME\auth.json
+%USERPROFILE%\.codex\auth.json
+```
+
+The token is read by the native Tauri backend only. Ai Usage Dock does not store a copy of it.
+
+### Claude Code
+
+Claude Code sync requires the included status-line setup script:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-claude-statusline.ps1
 ```
 
-If you already have a Claude Code status line, rerun with `-Force` only if you want Ai Usage Dock to replace it. The script creates a backup of `~\.claude\settings.json`.
+The script installs a Claude Code status-line command that writes sanitized rate-limit data to:
 
-Gemini expects a sanitized local quota export. If you have quota bucket JSON from a supported Gemini CLI helper, write it with:
+```text
+%USERPROFILE%\.ai-usage-dock\claude-code-usage.json
+```
+
+If you already have a Claude Code status line, rerun with `-Force` only if you want to replace it. The script creates a backup of `~\.claude\settings.json`.
+
+Claude Code only includes rate-limit data for supported Claude.ai subscriber sessions and usually only after a Claude Code API response has occurred.
+
+### Gemini
+
+Gemini sync reads a sanitized local export:
+
+```text
+%USERPROFILE%\.ai-usage-dock\gemini-cli-usage.json
+```
+
+If you have quota bucket JSON from a supported Gemini CLI helper, write the export with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\write-gemini-cli-quota-export.ps1 -QuotaJsonPath .\gemini-quota.json
 ```
 
-If Gemini CLI quota data is not available on your machine, keep Gemini in manual setup. Ai Usage Dock will show the Gemini local source as unavailable instead of guessing.
+If that quota data is not available, keep Gemini as manual. The app will not guess.
 
-## Commands
+## Build From Source
 
-```powershell
-npm install
-npm run dev
-npm run build
-npm run lint
-npm run test
-npm run setup:windows
-npm run setup:windows:installer
-npm run tauri:dev
-npm run tauri:build
-```
+Contributor workflow is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Windows Setup Script
+Requirements:
 
-Run this from the project root to install/check the tools needed to run and build the Tauri app:
+- Windows 10 or 11
+- Node.js LTS
+- Rust with MSVC target
+- Microsoft Edge WebView2 Runtime
+- Visual Studio Build Tools with MSVC and a compatible Windows SDK
+
+Install/check the Windows build tools:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 ```
 
-What it handles:
-
-- Node.js LTS through `winget`, if missing.
-- Microsoft Edge WebView2 Runtime through `winget`, if missing.
-- Rust/rustup through `winget`, if missing.
-- Visual Studio 2022 Build Tools with MSVC.
-- Latest compatible installed Windows SDK detection for native linking.
-- `npm install`.
-- `npm run build`, `npm run lint`, and `npm run test`.
-- `npm run tauri -- info`.
-
-Optional flags:
+Common development commands:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -SkipNativeBuildTools
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -NoNpmInstall
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1 -BuildInstaller
+npm install
+npm run dev
+npm run lint
+npm run test
+npm run build
+npm run tauri:dev
+npm run tauri:build
 ```
 
-The native MSI output will be under `src-tauri\target\release\bundle\msi` after a successful `-BuildInstaller` run.
-
-If `winget` says `rustup` is already installed but PowerShell cannot find `rustup`, `rustc`, or `cargo`, reopen PowerShell or run:
+Build the installer:
 
 ```powershell
-$env:Path="$env:USERPROFILE\.cargo\bin;$env:Path"
+npm run tauri:build
 ```
 
-The setup script adds this path automatically for the current run.
+The MSI output is written to:
 
-## Project Shape
+```text
+src-tauri\target\release\bundle\msi
+```
 
-- `src/domain`: active-provider model, multi-period reset logic, formatter, percentage calculation, tray tooltip derivation.
-- `src/data`: first-time setup helpers and provider/period defaults.
-- `src/adapters`: manual, estimated, unsupported, and placeholder official adapter classes that return unsupported until a real official/local source is implemented.
-- `src/security`: credential service abstraction. Browser dev mode never persists API keys.
-- `src/notifications`: low-usage notification manager.
-- `src-tauri`: native tray shell, local usage sync commands, menu actions, percentage icon rendering, secure credential commands, and hide-to-tray behavior.
+The setup helper can also build the installer:
+
+```powershell
+npm run setup:windows:installer
+```
+
+## Release Checklist
+
+For a public release:
+
+1. Bump versions in `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+2. Run validation:
+
+```powershell
+npm run lint
+npm run test
+npm run build
+cargo check --manifest-path .\src-tauri\Cargo.toml
+npm run tauri:build
+```
+
+3. Create a Git tag, for example `v0.1.1`.
+4. Upload the MSI to GitHub Releases.
+5. Publish a SHA256 checksum:
+
+```powershell
+Get-FileHash ".\src-tauri\target\release\bundle\msi\Ai Usage Dock_0.1.1_x64_en-US.msi" -Algorithm SHA256
+```
+
+6. Code-sign the installer when possible.
+
+## Project Structure
+
+- `src/App.tsx`: dashboard, setup flow, local sync UI, modals, and tray-facing state.
+- `src/domain`: provider model, reset logic, usage calculations, tray tooltip logic, and tests.
+- `src/data`: provider defaults and first-time setup helpers.
+- `src/adapters`: manual, estimated, unsupported, and placeholder official adapter classes.
+- `src/security`: credential helper abstraction.
+- `src/storage`: SQLite storage in Tauri mode and localStorage fallback in browser dev mode.
+- `src/notifications`: low-usage notification logic.
+- `src-tauri`: native tray app, secure credential commands, local usage sync commands, and installer config.
+- `scripts`: Windows setup, Claude Code status-line setup, and Gemini export helpers.
+
+## Known Limitations
+
+- Most consumer AI products do not expose official remaining-quota APIs.
+- Gemini support depends on an available local quota export.
+- Claude support depends on Claude Code status-line rate-limit data being present.
+- Unsigned public installers can trigger Windows reputation warnings.
+- The app currently tracks one active tray provider at a time.
+
+## License
+
+Ai Usage Dock is released under the MIT License. See [LICENSE](LICENSE).

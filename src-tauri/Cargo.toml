@@ -4,6 +4,7 @@ version = "0.1.1"
 description = "Local Windows tray app for tracking AI usage limits"
 authors = ["Codex"]
 edition = "2021"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
