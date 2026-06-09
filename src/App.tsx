@@ -1,59 +1,129 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  Bell,
-  BellOff,
-  CirclePlus,
-  Database,
-  Edit3,
-  Gauge,
-  Lock,
-  Plus,
-  RefreshCcw,
-  Settings,
-  ShieldCheck,
-  X,
-} from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+import { Check, Plus, RotateCcw, Settings, X } from 'lucide-react'
 import './App.css'
-import { createProvider, createInitialState } from './data/seed'
-import { createResetRule, getDefaultTimezone } from './domain/reset'
-import type { AppState, LimitUnit, Provider, ProviderDraft, ProviderPlan, ResetFrequency, UsageSource } from './domain/types'
-import { applyDueResets, formatUnit, summarizeProviders } from './domain/usage'
+import { createInitialState, createProvider, createUsagePeriod, PERIOD_LABELS, PROVIDER_OPTIONS } from './data/seed'
+import { calculateNextResetAt, formatResetDisplay, getDefaultTimezone } from './domain/reset'
+import {
+  addUsageToPeriod,
+  applyDueResets,
+  buildTrayTooltip,
+  formatAmount,
+  getActiveProvider,
+  getDisplayPeriod,
+  getSourceBadgeMeta,
+  getStatusForPercentage,
+  getTrayDisplayState,
+  normalizeUsagePeriod,
+  resetCurrentPeriod,
+} from './domain/usage'
+import type {
+  AiProvider,
+  AppState,
+  ProviderKind,
+  ResetDisplayFormat,
+  ResetRoutineType,
+  TooltipSettings,
+  UsagePeriod,
+  UsagePeriodLabel,
+  UsageSourceType,
+} from './domain/types'
 import { notifyLowUsage } from './notifications/notifications'
 import { createStorageDriver, type StorageDriver } from './storage/storage'
 
-const EMPTY_DRAFT: ProviderDraft = {
-  name: '',
-  plan: 'Custom',
-  source: 'manual',
-  limitUnit: 'messages',
-  maxQuota: 100,
-  usedQuota: 0,
-  resetFrequency: 'daily',
-  timezone: getDefaultTimezone(),
-  weeklyResetDay: 1,
-  monthlyResetDay: 1,
-  warningThresholdPercent: 20,
+const RESET_FORMAT_OPTIONS: Array<{ value: ResetDisplayFormat; label: string }> = [
+  { value: 'relative_countdown', label: 'How long until reset' },
+  { value: 'time_only', label: 'Exact time' },
+  { value: 'date_only', label: 'Date only' },
+  { value: 'date_time', label: 'Date + time' },
+  { value: 'weekday_date', label: 'Weekday + date' },
+  { value: 'custom', label: 'Custom fallback' },
+]
+
+const RESET_ROUTINE_OPTIONS: Array<{ value: ResetRoutineType; label: string }> = [
+  { value: 'rolling_5h', label: 'Rolling 5h' },
+  { value: 'fixed_daily', label: 'Daily fixed time' },
+  { value: 'fixed_weekly', label: 'Weekly fixed time' },
+  { value: 'fixed_monthly', label: 'Monthly fixed date' },
+  { value: 'custom_hours', label: 'Custom hours' },
+  { value: 'custom_datetime', label: 'Custom date/time' },
+]
+
+interface SetupDraft {
+  kind: ProviderKind
+  displayName: string
+  sourceType: UsageSourceType
+  selectedDisplayPeriodId: UsagePeriodLabel
+  tooltipPeriodIds: UsagePeriodLabel[]
+  timezone: string
+  fiveHourLimit?: number
+  fiveHourUsed?: number
+  weeklyLimit?: number
+  weeklyUsed?: number
+  resetFormat5h: ResetDisplayFormat
+  resetFormatWeekly: ResetDisplayFormat
 }
+
+interface LocalUsageWindow {
+  label: UsagePeriodLabel
+  used_percent: number
+  remaining_percent: number
+  reset_at?: string
+  limit_window_seconds?: number
+}
+
+interface LocalUsageResponse {
+  status: 'live' | 'unavailable' | 'error'
+  source: string
+  fetched_at: string
+  plan_type?: string
+  message?: string
+  windows: LocalUsageWindow[]
+}
+
+const LOCAL_SYNC_PROVIDER_KINDS: ProviderKind[] = ['chatgpt_codex', 'claude', 'gemini']
+const LOCAL_SYNC_COMMANDS: Partial<Record<ProviderKind, string>> = {
+  chatgpt_codex: 'sync_codex_usage',
+  claude: 'sync_claude_code_usage',
+  gemini: 'sync_gemini_usage',
+}
+
+const defaultSetupDraft = (): SetupDraft => ({
+  kind: 'chatgpt_codex',
+  displayName: 'ChatGPT Codex',
+  sourceType: 'local',
+  selectedDisplayPeriodId: '5h',
+  tooltipPeriodIds: ['5h', 'weekly'],
+  timezone: getDefaultTimezone(),
+  resetFormat5h: 'time_only',
+  resetFormatWeekly: 'weekday_date',
+})
 
 function App() {
   const [state, setState] = useState<AppState>(() => createInitialState())
-  const [ready, setReady] = useState(false)
-  const [providerModal, setProviderModal] = useState<ProviderDraft | null>(null)
-  const [usageModalOpen, setUsageModalOpen] = useState(false)
+  const [storage, setStorage] = useState<StorageDriver | null>(null)
+  const [loaded, setLoaded] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const storageRef = useRef<StorageDriver | null>(null)
+  const [addUsageOpen, setAddUsageOpen] = useState(false)
+  const [setupOpen, setSetupOpen] = useState(false)
+  const [syncingProviderKind, setSyncingProviderKind] = useState<ProviderKind | null>(null)
+
+  const activeProvider = useMemo(() => getActiveProvider(state.providers), [state.providers])
+  const activePeriod = useMemo(() => getDisplayPeriod(activeProvider), [activeProvider])
+  const trayState = useMemo(() => getTrayDisplayState(state.providers), [state.providers])
+  const localSyncKey = useMemo(() => getLocalSyncKinds(state.providers).join('|'), [state.providers])
 
   useEffect(() => {
     let cancelled = false
     async function load() {
-      const storage = await createStorageDriver()
-      const savedState = await storage.load()
+      const driver = await createStorageDriver()
+      const saved = await driver.load()
       if (cancelled) return
-      storageRef.current = storage
-      setState(savedState ?? createInitialState())
-      setReady(true)
+      setStorage(driver)
+      setState(migrateState(saved))
+      setLoaded(true)
     }
-
     load()
     return () => {
       cancelled = true
@@ -61,529 +131,811 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!ready) return
-    storageRef.current?.save(state)
-  }, [ready, state])
+    if (!loaded || !storage) return
+    storage.save(state)
+  }, [loaded, state, storage])
 
   useEffect(() => {
-    const intervalId = window.setInterval(() => {
+    if (!loaded) return
+    updateTrayState(trayState)
+    notifyLowUsage(state, setState)
+  }, [loaded, state, trayState])
+
+  useEffect(() => {
+    if (!loaded || !isTauriRuntime()) return
+    if (state.settings.openDashboardOnStartup || !state.settings.startMinimizedToTray) {
+      invoke('show_dashboard')
+    }
+  }, [loaded, state.settings.openDashboardOnStartup, state.settings.startMinimizedToTray])
+
+  useEffect(() => {
+    if (!loaded) return
+    const timer = window.setInterval(() => {
       setState((current) => applyDueResets(current))
     }, 60_000)
-    return () => window.clearInterval(intervalId)
-  }, [])
+    return () => window.clearInterval(timer)
+  }, [loaded])
 
   useEffect(() => {
-    if (!ready) return
-    notifyLowUsage(state, setState)
-  }, [ready, state])
-
-  useEffect(() => {
-    if (!isTauriRuntime()) return
-
-    let unlisten: undefined | (() => void)
-    import('@tauri-apps/api/event')
-      .then(({ listen }) =>
-        listen<string>('tray-action', (event) => {
-          if (event.payload === 'add-usage') setUsageModalOpen(true)
-          if (event.payload === 'settings') setSettingsOpen(true)
-          if (event.payload === 'reset-first-provider') {
-            setState((current) => {
-              const firstProvider = current.providers[0]
-              return firstProvider ? resetProvider(current, firstProvider.id) : current
-            })
-          }
-        }),
-      )
-      .then((cleanup) => {
-        unlisten = cleanup
-      })
-      .catch((error) => console.warn('Tray event listener unavailable.', error))
-
-    return () => unlisten?.()
-  }, [])
-
-  const summaries = useMemo(() => summarizeProviders(state), [state])
-  const globalStatus = summaries.some((summary) => summary.status === 'red')
-    ? 'red'
-    : summaries.some((summary) => summary.status === 'yellow')
-      ? 'yellow'
-      : 'green'
-
-  function saveProvider(draft: ProviderDraft) {
-    setState((current) => {
-      if (draft.id) {
-        return {
-          ...current,
-          providers: current.providers.map((provider) =>
-            provider.id === draft.id ? updateProviderFromDraft(provider, draft) : provider,
-          ),
-          notificationRules: current.notificationRules.map((rule) =>
-            rule.providerId === draft.id ? { ...rule, thresholdPercent: draft.warningThresholdPercent } : rule,
-          ),
+    if (!loaded || !isTauriRuntime() || !localSyncKey) return
+    const providerKinds = localSyncKey.split('|') as ProviderKind[]
+    async function syncConfiguredLocalUsage() {
+      for (const providerKind of providerKinds) {
+        const command = LOCAL_SYNC_COMMANDS[providerKind]
+        if (!command) continue
+        try {
+          const response = await invoke<LocalUsageResponse>(command)
+          setState((current) => applyLocalUsageSync(current, providerKind, response))
+        } catch (error) {
+          setState((current) => markLocalSyncFailed(current, providerKind, String(error)))
         }
       }
+    }
 
-      const provider = createProviderFromDraft(draft)
-      return {
-        ...current,
-        providers: [...current.providers, provider],
-        notificationRules: [
-          ...current.notificationRules,
-          {
-            id: crypto.randomUUID(),
-            providerId: provider.id,
-            enabled: true,
-            thresholdPercent: draft.warningThresholdPercent,
-            cooldownMinutes: 180,
-          },
-        ],
-      }
+    void syncConfiguredLocalUsage()
+    const timer = window.setInterval(() => {
+      void syncConfiguredLocalUsage()
+    }, 120_000)
+    return () => window.clearInterval(timer)
+  }, [localSyncKey, loaded])
+
+  useEffect(() => {
+    const unlisten = listen<string>('tray-action', (event) => {
+      if (event.payload === 'add-usage') setAddUsageOpen(true)
+      if (event.payload === 'settings') setSettingsOpen(true)
+      if (event.payload === 'reset-current-period') setState((current) => resetCurrentPeriod(current))
     })
-    setProviderModal(null)
-  }
+    return () => {
+      unlisten.then((dispose) => dispose())
+    }
+  }, [])
 
-  function addUsage(providerId: string, amount: number) {
+  function saveProvider(provider: AiProvider) {
     setState((current) => {
-      const provider = current.providers.find((item) => item.id === providerId)
-      const limit = provider?.models[0]?.limits[0]
-      if (!provider || !limit || !Number.isFinite(amount) || amount <= 0) return current
-
+      const exists = current.providers.some((item) => item.id === provider.id)
+      const providers = exists
+        ? current.providers.map((item) => (item.id === provider.id ? provider : item))
+        : [...current.providers, provider]
       return {
         ...current,
-        providers: current.providers.map((item) =>
-          item.id === providerId
-            ? {
-                ...item,
-                updatedAt: new Date().toISOString(),
-                models: item.models.map((model, index) =>
-                  index === 0
-                    ? {
-                        ...model,
-                        limits: model.limits.map((modelLimit, limitIndex) =>
-                          limitIndex === 0
-                            ? { ...modelLimit, usedQuota: Math.min(modelLimit.maxQuota, modelLimit.usedQuota + amount) }
-                            : modelLimit,
-                        ),
-                      }
-                    : model,
-                ),
-              }
-            : item,
-        ),
-        usageRecords: [
-          {
-            id: crypto.randomUUID(),
-            providerId,
-            modelId: limit.modelId,
-            limitId: limit.id,
-            amount,
-            unit: limit.unit,
-            source: 'manual' as const,
-            note: 'Manual entry',
-            occurredAt: new Date().toISOString(),
-          },
-          ...current.usageRecords,
-        ].slice(0, 500),
+        providers: providers.map((item) => ({ ...item, active: item.id === provider.id })),
+        notificationRules: ensureNotificationRules(current.notificationRules, provider),
       }
     })
   }
 
-  function toggleNotifications() {
+  function updateProvider(provider: AiProvider) {
     setState((current) => ({
       ...current,
-      settings: {
-        ...current.settings,
-        notificationsEnabled: !current.settings.notificationsEnabled,
-      },
+      providers: current.providers.map((item) => (item.id === provider.id ? provider : item)),
     }))
   }
 
-  function resetAllData() {
-    setState(createInitialState())
+  function setActiveProvider(providerId: string) {
+    setState((current) => ({
+      ...current,
+      providers: current.providers.map((provider) => ({ ...provider, active: provider.id === providerId })),
+    }))
+  }
+
+  function handleAddUsage(providerId: string, periodId: string, amount: number, note?: string) {
+    setState((current) => addUsageToPeriod(current, providerId, periodId, amount, note))
+    setAddUsageOpen(false)
+  }
+
+  async function syncLocalUsage(providerKind: ProviderKind, showSpinner = true) {
+    if (!isTauriRuntime()) return
+    const command = LOCAL_SYNC_COMMANDS[providerKind]
+    if (!command) return
+    if (showSpinner) setSyncingProviderKind(providerKind)
+    try {
+      const response = await invoke<LocalUsageResponse>(command)
+      setState((current) => applyLocalUsageSync(current, providerKind, response))
+    } catch (error) {
+      setState((current) => markLocalSyncFailed(current, providerKind, String(error)))
+    } finally {
+      if (showSpinner) setSyncingProviderKind(null)
+    }
+  }
+
+  if (!loaded) {
+    return <Shell><p className="muted">Loading Ai Usage Dock...</p></Shell>
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <div className={`app-mark status-${globalStatus}`} aria-hidden="true">
-            <Gauge size={20} />
-          </div>
-          <div>
-            <h1>LLM Usage Tray</h1>
-            <p>Local quota tracking for the AI tools you actually use.</p>
-          </div>
+    <Shell>
+      <header className="app-header">
+        <div>
+          <p className="eyebrow">Windows tray usage dock</p>
+          <h1>Ai Usage Dock</h1>
         </div>
-        <div className="topbar-actions">
-          <button className="icon-button" type="button" onClick={toggleNotifications} title="Toggle notifications">
-            {state.settings.notificationsEnabled ? <Bell size={18} /> : <BellOff size={18} />}
-          </button>
-          <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="Settings">
-            <Settings size={18} />
-          </button>
-          <button className="primary-button" type="button" onClick={() => setProviderModal(EMPTY_DRAFT)}>
-            <CirclePlus size={18} />
-            Add provider
-          </button>
-        </div>
+        <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} title="Settings">
+          <Settings size={18} />
+        </button>
       </header>
 
-      <section className="summary-strip" aria-label="Overall usage summary">
-        <SummaryItem label="Tracked tools" value={String(state.providers.length)} />
-        <SummaryItem label="Low usage" value={String(summaries.filter((summary) => summary.status === 'yellow').length)} />
-        <SummaryItem label="Exhausted" value={String(summaries.filter((summary) => summary.status === 'red').length)} />
-        <SummaryItem label="Records" value={String(state.usageRecords.length)} />
-      </section>
-
-      <section className="provider-grid" aria-label="Provider usage">
-        {summaries.map((summary) => {
-          const limit = summary.limits[0]
-          return (
-            <article className={`provider-card status-${summary.status}`} key={summary.provider.id}>
-              <div className="provider-card-header">
-                <div>
-                  <div className="provider-title-row">
-                    <h2>{summary.provider.name}</h2>
-                    <span className={`status-dot status-${summary.status}`}></span>
-                  </div>
-                  <p>{summary.provider.plan} plan</p>
-                </div>
-                <SourceBadge source={summary.provider.source} />
-              </div>
-
-              {limit ? (
-                <>
-                  <div className="usage-meter">
-                    <div>
-                      <span className="meter-value">{limit.remainingPercent}%</span>
-                      <span className="meter-label">remaining</span>
-                    </div>
-                    <div className="meter-track" aria-hidden="true">
-                      <span style={{ width: `${limit.remainingPercent}%` }}></span>
-                    </div>
-                  </div>
-
-                  <dl className="usage-facts">
-                    <div>
-                      <dt>Used</dt>
-                      <dd>
-                        {formatUnit(limit.used, limit.limit.unit)} / {formatUnit(limit.limit.maxQuota, limit.limit.unit)}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Next reset</dt>
-                      <dd>{limit.resetCountdown}</dd>
-                    </div>
-                    <div>
-                      <dt>Unit</dt>
-                      <dd>{limit.limit.unit}</dd>
-                    </div>
-                    <div>
-                      <dt>Warning</dt>
-                      <dd>{limit.limit.warningThresholdPercent}%</dd>
-                    </div>
-                  </dl>
-
-                  <div className="card-actions">
-                    <button type="button" onClick={() => addUsage(summary.provider.id, 1)}>
-                      <Plus size={16} />1
-                    </button>
-                    <button type="button" onClick={() => addUsage(summary.provider.id, 10)}>
-                      <Plus size={16} />
-                      10
-                    </button>
-                    <button type="button" onClick={() => setProviderModal(providerToDraft(summary.provider))}>
-                      <Edit3 size={16} />
-                      Edit
-                    </button>
-                    <button type="button" onClick={() => setState((current) => resetProvider(current, summary.provider.id))}>
-                      <RefreshCcw size={16} />
-                      Reset
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <p className="empty-note">No usage limits configured.</p>
-              )}
-            </article>
-          )
-        })}
-      </section>
+      {state.providers.length === 0 ? (
+        <FirstTimeSetup onFinish={(provider) => saveProvider(provider)} />
+      ) : (
+        <Dashboard
+          provider={activeProvider}
+          activePeriod={activePeriod}
+          providers={state.providers}
+          onAddUsage={() => setAddUsageOpen(true)}
+          onReset={() => setState((current) => resetCurrentPeriod(current))}
+          onSettings={() => setSettingsOpen(true)}
+          onSetup={() => setSetupOpen(true)}
+          onSetActive={setActiveProvider}
+          onSyncLocal={(providerKind) => void syncLocalUsage(providerKind)}
+          syncingProviderKind={syncingProviderKind}
+        />
+      )}
 
       <section className="privacy-note">
-        <ShieldCheck size={18} />
-        <span>
-          This MVP stores quota data locally and never asks for ChatGPT, Claude, Gemini, Perplexity, Cursor, or Codex
-          passwords.
-        </span>
+        <strong>Local and honest.</strong> No scraping, cookies, passwords, hidden limits, or fake official usage.
       </section>
 
-      {providerModal && (
-        <ProviderModal
-          draft={providerModal}
-          onClose={() => setProviderModal(null)}
-          onSave={saveProvider}
-        />
-      )}
-      {usageModalOpen && (
-        <UsageModal
-          providers={state.providers}
-          onAdd={addUsage}
-          onClose={() => setUsageModalOpen(false)}
-        />
-      )}
       {settingsOpen && (
         <SettingsModal
           state={state}
           onClose={() => setSettingsOpen(false)}
-          onReset={resetAllData}
-          onToggleNotifications={toggleNotifications}
+          onChange={setState}
+          onUpdateProvider={updateProvider}
+          onSetActive={setActiveProvider}
         />
       )}
-    </main>
+      {addUsageOpen && state.providers.length > 0 && (
+        <AddUsageModal
+          providers={state.providers}
+          defaultProviderId={activeProvider?.id}
+          onClose={() => setAddUsageOpen(false)}
+          onAdd={handleAddUsage}
+        />
+      )}
+      {setupOpen && (
+        <Modal title="Add Provider" onClose={() => setSetupOpen(false)}>
+          <FirstTimeSetup
+            compact
+            onFinish={(provider) => {
+              saveProvider(provider)
+              setSetupOpen(false)
+            }}
+          />
+        </Modal>
+      )}
+    </Shell>
   )
 }
 
-function SummaryItem({ label, value }: { label: string; value: string }) {
+function Shell({ children }: { children: React.ReactNode }) {
+  return <main className="app-shell">{children}</main>
+}
+
+function Dashboard({
+  provider,
+  activePeriod,
+  providers,
+  onAddUsage,
+  onReset,
+  onSettings,
+  onSetup,
+  onSetActive,
+  onSyncLocal,
+  syncingProviderKind,
+}: {
+  provider?: AiProvider
+  activePeriod?: UsagePeriod
+  providers: AiProvider[]
+  onAddUsage: () => void
+  onReset: () => void
+  onSettings: () => void
+  onSetup: () => void
+  onSetActive: (providerId: string) => void
+  onSyncLocal: (providerKind: ProviderKind) => void
+  syncingProviderKind: ProviderKind | null
+}) {
+  if (!provider) {
+    return (
+      <section className="empty-state">
+        <h2>Setup required</h2>
+        <p>Choose provider and limits to start tracking.</p>
+        <button type="button" onClick={onSetup}>Start setup</button>
+      </section>
+    )
+  }
+
+  const display = activePeriod ? normalizeUsagePeriod(activePeriod) : undefined
+
   return (
-    <div className="summary-item">
-      <span>{value}</span>
-      <p>{label}</p>
+    <div className="dashboard-grid">
+      <section className="hero-panel">
+        <p className="eyebrow">Active provider</p>
+        <h2>{provider.displayName}</h2>
+        <p className="muted">Tray display: {display?.label ?? 'Not configured'} remaining</p>
+        <div className={`status-pill ${getStatusForPercentage(display?.percentageRemaining)}`}>
+          {display?.percentageRemaining === undefined ? 'Setup required' : `${display.percentageRemaining}% remaining`}
+        </div>
+        {display && (
+          <ProgressBar percentage={display.percentageRemaining} />
+        )}
+        {display?.limit ? (
+          <p>{formatAmount(display.remaining)} / {formatAmount(display.limit)} remaining</p>
+        ) : (
+          <p className="setup-warning">No limit configured for {provider.displayName} {display?.label ?? ''} period.</p>
+        )}
+        {display && (
+          <p className="muted">
+            {formatResetDisplay({
+              nextResetAt: display.nextResetAt,
+              format: display.resetDisplaySettings.format,
+              timezone: display.resetDisplaySettings.timezone,
+              use24HourTime: display.resetDisplaySettings.use24HourTime,
+            })}
+          </p>
+        )}
+        <div className="button-row">
+          {isLocalSyncProvider(provider) && (
+            <button type="button" onClick={() => onSyncLocal(provider.kind)} disabled={syncingProviderKind === provider.kind}>
+              <RotateCcw size={16} /> {syncingProviderKind === provider.kind ? `Syncing ${getLocalSyncLabel(provider.kind)}` : `Sync ${getLocalSyncLabel(provider.kind)}`}
+            </button>
+          )}
+          <button type="button" onClick={onAddUsage}><Plus size={16} /> Add Usage</button>
+          <button type="button" onClick={onReset}><RotateCcw size={16} /> Reset Current Period</button>
+          <button type="button" onClick={onSettings}><Settings size={16} /> Settings</button>
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Provider</h2>
+        <label>
+          Active provider
+          <select value={provider.id} onChange={(event) => onSetActive(event.target.value)}>
+            {providers.map((item) => (
+              <option key={item.id} value={item.id}>{item.displayName}</option>
+            ))}
+          </select>
+        </label>
+        <button type="button" onClick={onSetup}>Add provider</button>
+      </section>
+
+      <section className="period-list">
+        {provider.supportedPeriods.map((period) => (
+          <PeriodCard key={period.id} period={period} active={period.id === provider.selectedDisplayPeriodId} />
+        ))}
+      </section>
     </div>
   )
 }
 
-function SourceBadge({ source }: { source: UsageSource }) {
-  return <span className={`source-badge source-${source}`}>{source}</span>
-}
-
-function ProviderModal({
-  draft,
-  onClose,
-  onSave,
-}: {
-  draft: ProviderDraft
-  onClose: () => void
-  onSave: (draft: ProviderDraft) => void
-}) {
-  const [form, setForm] = useState(draft)
-
-  function update<K extends keyof ProviderDraft>(key: K, value: ProviderDraft[K]) {
-    setForm((current) => ({ ...current, [key]: value }))
-  }
+function PeriodCard({ period, active }: { period: UsagePeriod; active?: boolean }) {
+  const normalized = normalizeUsagePeriod(period)
+  const badge = getSourceBadgeMeta(normalized.sourceType)
+  const stateText = getPeriodStateText(normalized)
 
   return (
-    <Modal title={form.id ? 'Edit provider' : 'Add provider'} onClose={onClose}>
-      <form
-        className="modal-form"
-        onSubmit={(event) => {
-          event.preventDefault()
-          onSave({ ...form, name: form.name.trim() || 'Custom provider' })
-        }}
-      >
-        <label>
-          Provider name
-          <input value={form.name} onChange={(event) => update('name', event.target.value)} placeholder="ChatGPT" />
-        </label>
-        <div className="form-row">
-          <label>
-            Plan
-            <select value={form.plan} onChange={(event) => update('plan', event.target.value as ProviderPlan)}>
-              {['Free', 'Plus', 'Pro', 'Team', 'API', 'Custom'].map((option) => (
-                <option key={option}>{option}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Data label
-            <select value={form.source} onChange={(event) => update('source', event.target.value as UsageSource)}>
-              <option value="manual">Manual</option>
-              <option value="estimated">Estimated</option>
-              <option value="official" disabled>
-                Official (future adapter)
-              </option>
-            </select>
-          </label>
+    <article className={`period-card ${active ? 'active' : ''}`}>
+      <div className="period-card-header">
+        <div>
+          <h3>{normalized.label}</h3>
+          <p className="muted">{stateText.title}</p>
         </div>
-        <div className="form-row">
-          <label>
-            Limit type
-            <select value={form.limitUnit} onChange={(event) => update('limitUnit', event.target.value as LimitUnit)}>
-              {['messages', 'tokens', 'credits', 'requests', 'dollars'].map((option) => (
-                <option key={option}>{option}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Warning at
-            <input
-              type="number"
-              min="1"
-              max="99"
-              value={form.warningThresholdPercent}
-              onChange={(event) => update('warningThresholdPercent', Number(event.target.value))}
-            />
-          </label>
-        </div>
-        <div className="form-row">
-          <label>
-            Max quota
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={form.maxQuota}
-              onChange={(event) => update('maxQuota', Number(event.target.value))}
-            />
-          </label>
-          <label>
-            Used quota
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={form.usedQuota}
-              onChange={(event) => update('usedQuota', Number(event.target.value))}
-            />
-          </label>
-        </div>
-        <div className="form-row">
-          <label>
-            Reset frequency
-            <select
-              value={form.resetFrequency}
-              onChange={(event) => update('resetFrequency', event.target.value as ResetFrequency)}
-            >
-              <option value="daily">Daily</option>
-              <option value="weekly">Weekly</option>
-              <option value="monthly">Monthly</option>
-              <option value="customHours">Custom hours</option>
-            </select>
-          </label>
-          <label>
-            Timezone
-            <input value={form.timezone} onChange={(event) => update('timezone', event.target.value)} />
-          </label>
-        </div>
-        {form.resetFrequency === 'customHours' && (
-          <label>
-            Custom reset hours
-            <input
-              type="number"
-              min="1"
-              value={form.customHours ?? 24}
-              onChange={(event) => update('customHours', Number(event.target.value))}
-            />
-          </label>
-        )}
-        <div className="modal-actions">
-          <button type="button" className="secondary-button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary-button">
-            Save provider
-          </button>
-        </div>
-      </form>
-    </Modal>
+        <span className={`source-badge ${normalized.sourceType}`}>{badge.label}</span>
+      </div>
+      <p>{stateText.body}</p>
+      <strong>{normalized.percentageRemaining === undefined ? '--' : normalized.percentageRemaining}%</strong>
+      <ProgressBar percentage={normalized.percentageRemaining} />
+      <dl>
+        <Fact label="Used" value={formatAmount(normalized.used)} />
+        <Fact label="Limit" value={formatAmount(normalized.limit)} />
+        <Fact
+          label="Reset"
+          value={formatResetDisplay({
+            nextResetAt: normalized.nextResetAt,
+            format: normalized.resetDisplaySettings.format,
+            timezone: normalized.resetDisplaySettings.timezone,
+            use24HourTime: normalized.resetDisplaySettings.use24HourTime,
+          })}
+        />
+      </dl>
+    </article>
   )
 }
 
-function UsageModal({
-  providers,
-  onAdd,
-  onClose,
-}: {
-  providers: Provider[]
-  onAdd: (providerId: string, amount: number) => void
-  onClose: () => void
-}) {
-  const [providerId, setProviderId] = useState(providers[0]?.id ?? '')
-  const [amount, setAmount] = useState(1)
+function FirstTimeSetup({ onFinish, compact = false }: { onFinish: (provider: AiProvider) => void; compact?: boolean }) {
+  const [step, setStep] = useState(1)
+  const [draft, setDraft] = useState<SetupDraft>(() => defaultSetupDraft())
+  const option = PROVIDER_OPTIONS.find((item) => item.kind === draft.kind)
+  const canFinish = Boolean(draft.displayName.trim()) && (draft.sourceType === 'local' || draft.fiveHourLimit || draft.weeklyLimit)
+
+  function updateProviderKind(kind: ProviderKind) {
+    const next = PROVIDER_OPTIONS.find((item) => item.kind === kind)
+    setDraft((current) => ({
+      ...current,
+      kind,
+      displayName: next?.label ?? current.displayName,
+      sourceType: next?.sourceType ?? 'manual',
+    }))
+  }
+
+  function finish() {
+    const periods = PERIOD_LABELS.map((label) =>
+      createUsagePeriod({
+        label,
+        sourceType: draft.sourceType,
+        limit: label === '5h' ? draft.fiveHourLimit : label === 'weekly' ? draft.weeklyLimit : undefined,
+        used: label === '5h' ? draft.fiveHourUsed : label === 'weekly' ? draft.weeklyUsed : undefined,
+        timezone: draft.timezone,
+        resetDisplayFormat: label === '5h' ? draft.resetFormat5h : label === 'weekly' ? draft.resetFormatWeekly : undefined,
+      }),
+    )
+    onFinish(createProvider({
+      kind: draft.kind,
+      displayName: draft.displayName.trim(),
+      sourceType: draft.sourceType,
+      periods,
+      selectedDisplayPeriodId: draft.selectedDisplayPeriodId,
+      timezone: draft.timezone,
+      notes: option?.sourceType === 'official'
+        ? 'Only documented official API data may be labeled official. Consumer web subscriptions remain manual unless the provider exposes official usage data.'
+        : option?.setupNote ?? 'Manual tracking. Update usage when you use your AI subscription.',
+    }))
+  }
 
   return (
-    <Modal title="Add usage" onClose={onClose}>
-      <form
-        className="modal-form"
-        onSubmit={(event) => {
-          event.preventDefault()
-          onAdd(providerId, amount)
-          onClose()
-        }}
-      >
-        <label>
-          Provider
-          <select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
-            {providers.map((provider) => (
-              <option key={provider.id} value={provider.id}>
-                {provider.name}
-              </option>
+    <section className={compact ? 'setup compact' : 'setup'}>
+      <div className="setup-header">
+        <div>
+          <p className="eyebrow">First-time setup</p>
+          <h2>Choose what appears in your Windows tray</h2>
+        </div>
+        <span>{step} / 7</span>
+      </div>
+
+      {step === 1 && (
+        <SetupStep title="Choose AI provider" helper="Choose the AI subscription you want to monitor.">
+          <select value={draft.kind} onChange={(event) => updateProviderKind(event.target.value as ProviderKind)}>
+            {PROVIDER_OPTIONS.map((provider) => (
+              <option key={provider.kind} value={provider.kind}>{provider.label}</option>
             ))}
           </select>
-        </label>
-        <label>
-          Amount used
-          <input type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(Number(event.target.value))} />
-        </label>
-        <div className="modal-actions">
-          <button type="button" className="secondary-button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="submit" className="primary-button">
-            Add usage
-          </button>
-        </div>
-      </form>
-    </Modal>
+          <input value={draft.displayName} onChange={(event) => setDraft({ ...draft, displayName: event.target.value })} />
+          <p className="setup-warning">{option?.setupNote}</p>
+        </SetupStep>
+      )}
+
+      {step === 2 && (
+        <SetupStep title="Choose display period" helper="Choose what you want to see in your Windows tray.">
+          <Segmented
+            options={['5h', 'daily', 'weekly', 'monthly', 'custom']}
+            value={draft.selectedDisplayPeriodId}
+            onChange={(value) => setDraft({ ...draft, selectedDisplayPeriodId: value as UsagePeriodLabel })}
+          />
+        </SetupStep>
+      )}
+
+      {step === 3 && (
+        <SetupStep title="Set limit" helper="Set the usage limit shown in your AI app. If official sync is unavailable, track it manually.">
+          <div className="two-column">
+            <NumberField label="5h limit" value={draft.fiveHourLimit} onChange={(value) => setDraft({ ...draft, fiveHourLimit: value })} />
+            <NumberField label="5h used" value={draft.fiveHourUsed} onChange={(value) => setDraft({ ...draft, fiveHourUsed: value })} />
+            <NumberField label="Weekly limit" value={draft.weeklyLimit} onChange={(value) => setDraft({ ...draft, weeklyLimit: value })} />
+            <NumberField label="Weekly used" value={draft.weeklyUsed} onChange={(value) => setDraft({ ...draft, weeklyUsed: value })} />
+          </div>
+          <label>Timezone<input value={draft.timezone} onChange={(event) => setDraft({ ...draft, timezone: event.target.value })} /></label>
+        </SetupStep>
+      )}
+
+      {step === 4 && (
+        <SetupStep title="Choose tray display" helper="Pick the period whose percentage appears in the tray icon.">
+          <Segmented
+            options={['5h', 'weekly', 'custom']}
+            value={draft.selectedDisplayPeriodId}
+            onChange={(value) => setDraft({ ...draft, selectedDisplayPeriodId: value as UsagePeriodLabel })}
+          />
+        </SetupStep>
+      )}
+
+      {step === 5 && (
+        <SetupStep title="Choose next reset display" helper="Choose how reset time is shown in dashboard and tooltip.">
+          <label>5h reset display<ResetFormatSelect value={draft.resetFormat5h} onChange={(value) => setDraft({ ...draft, resetFormat5h: value })} /></label>
+          <label>Weekly reset display<ResetFormatSelect value={draft.resetFormatWeekly} onChange={(value) => setDraft({ ...draft, resetFormatWeekly: value })} /></label>
+        </SetupStep>
+      )}
+
+      {step === 6 && (
+        <SetupStep title="Choose tooltip fields" helper="Choose which periods appear when you hover over the tray icon.">
+          <Checkbox
+            label="5h remaining and next reset"
+            checked={draft.tooltipPeriodIds.includes('5h')}
+            onChange={(checked) => setDraft({ ...draft, tooltipPeriodIds: toggleValue(draft.tooltipPeriodIds, '5h', checked) })}
+          />
+          <Checkbox
+            label="Weekly remaining and next reset"
+            checked={draft.tooltipPeriodIds.includes('weekly')}
+            onChange={(checked) => setDraft({ ...draft, tooltipPeriodIds: toggleValue(draft.tooltipPeriodIds, 'weekly', checked) })}
+          />
+        </SetupStep>
+      )}
+
+      {step === 7 && (
+        <SetupStep title="Finish" helper="Save this provider and keep Ai Usage Dock running quietly in the tray.">
+          <PreviewProvider draft={draft} />
+        </SetupStep>
+      )}
+
+      <div className="modal-actions">
+        <button type="button" disabled={step === 1} onClick={() => setStep((value) => Math.max(1, value - 1))}>Back</button>
+        {step < 7 ? (
+          <button type="button" onClick={() => setStep((value) => Math.min(7, value + 1))}>Next</button>
+        ) : (
+          <button type="button" disabled={!canFinish} onClick={finish}><Check size={16} /> Finish setup</button>
+        )}
+      </div>
+    </section>
   )
 }
 
 function SettingsModal({
   state,
+  onChange,
   onClose,
-  onReset,
-  onToggleNotifications,
+  onUpdateProvider,
+  onSetActive,
 }: {
   state: AppState
+  onChange: (state: AppState) => void
   onClose: () => void
-  onReset: () => void
-  onToggleNotifications: () => void
+  onUpdateProvider: (provider: AiProvider) => void
+  onSetActive: (providerId: string) => void
 }) {
+  const activeProvider = getActiveProvider(state.providers)
+  const [selectedProviderId, setSelectedProviderId] = useState(activeProvider?.id ?? state.providers[0]?.id ?? '')
+  const provider = state.providers.find((item) => item.id === selectedProviderId) ?? activeProvider
+
+  function updateSettings(settings: Partial<AppState['settings']>) {
+    if (settings.openAtLogin !== undefined && isTauriRuntime()) {
+      invoke('set_open_at_login', { enabled: settings.openAtLogin }).catch(() => undefined)
+    }
+    onChange({ ...state, settings: { ...state.settings, ...settings } })
+  }
+
   return (
     <Modal title="Settings" onClose={onClose}>
-      <div className="settings-stack">
-        <div className="settings-row">
-          <div>
-            <h3>Notifications</h3>
-            <p>Alert once a provider reaches its warning threshold.</p>
-          </div>
-          <button className="secondary-button" type="button" onClick={onToggleNotifications}>
-            {state.settings.notificationsEnabled ? 'Enabled' : 'Disabled'}
-          </button>
-        </div>
-        <div className="settings-row">
-          <div>
-            <h3>Storage</h3>
-            <p>Desktop builds use local SQLite. Browser dev mode uses localStorage fallback.</p>
-          </div>
-          <Database size={20} />
-        </div>
-        <div className="settings-row">
-          <div>
-            <h3>Privacy</h3>
-            <p>No passwords, browser cookies, or cloud backend. API keys will use secure storage in a later adapter phase.</p>
-          </div>
-          <Lock size={20} />
-        </div>
-        <button type="button" className="danger-button" onClick={onReset}>
-          Reset sample data
-        </button>
-      </div>
+      <section className="settings-section">
+        <h3>Startup behavior</h3>
+        <Checkbox label="Start with Windows" checked={state.settings.openAtLogin} onChange={(checked) => updateSettings({ openAtLogin: checked })} />
+        <Checkbox label="Open dashboard on startup" checked={state.settings.openDashboardOnStartup} onChange={(checked) => updateSettings({ openDashboardOnStartup: checked })} />
+        <Checkbox label="Start minimized to tray" checked={state.settings.startMinimizedToTray} onChange={(checked) => updateSettings({ startMinimizedToTray: checked })} />
+        <Checkbox label="Notifications" checked={state.settings.notificationsEnabled} onChange={(checked) => updateSettings({ notificationsEnabled: checked })} />
+      </section>
+
+      {provider && (
+        <section className="settings-section">
+          <h3>Tray provider</h3>
+          <label>
+            Active provider
+            <select
+              value={provider.id}
+              onChange={(event) => {
+                setSelectedProviderId(event.target.value)
+                onSetActive(event.target.value)
+              }}
+            >
+              {state.providers.map((item) => (
+                <option key={item.id} value={item.id}>{item.displayName}</option>
+              ))}
+            </select>
+          </label>
+          <ProviderSettings provider={provider} onChange={onUpdateProvider} />
+        </section>
+      )}
     </Modal>
   )
 }
 
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
+function ProviderSettings({ provider, onChange }: { provider: AiProvider; onChange: (provider: AiProvider) => void }) {
+  function updatePeriod(periodId: string, patch: Partial<UsagePeriod>) {
+    const nextProvider = {
+      ...provider,
+      supportedPeriods: provider.supportedPeriods.map((period) => {
+        if (period.id !== periodId) return period
+        const merged = normalizeUsagePeriod({ ...period, ...patch })
+        return {
+          ...merged,
+          nextResetAt: patch.resetRoutine
+            ? calculateNextResetAt(patch.resetRoutine, new Date(), period.nextResetAt)
+            : merged.nextResetAt,
+        }
+      }),
+      lastUpdatedAt: new Date().toISOString(),
+    }
+    onChange(nextProvider)
+  }
+
+  function updateTooltipSettings(patch: Partial<TooltipSettings>) {
+    onChange({ ...provider, tooltipSettings: { ...provider.tooltipSettings, ...patch } })
+  }
+
+  return (
+    <div className="settings-stack">
+      <label>
+        Display period
+        <select value={provider.selectedDisplayPeriodId} onChange={(event) => onChange({ ...provider, selectedDisplayPeriodId: event.target.value })}>
+          {provider.supportedPeriods.map((period) => (
+            <option key={period.id} value={period.id}>{period.label}</option>
+          ))}
+        </select>
+      </label>
+
+      <fieldset>
+        <legend>Tooltip periods</legend>
+        {provider.supportedPeriods.map((period) => (
+          <Checkbox
+            key={period.id}
+            label={period.label}
+            checked={provider.tooltipPeriodIds.includes(period.id)}
+            onChange={(checked) => onChange({ ...provider, tooltipPeriodIds: toggleValue(provider.tooltipPeriodIds, period.id, checked) })}
+          />
+        ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>Tooltip fields</legend>
+        <Checkbox label="Percentage" checked={provider.tooltipSettings.showPercentage} onChange={(checked) => updateTooltipSettings({ showPercentage: checked })} />
+        <Checkbox label="Remaining amount" checked={provider.tooltipSettings.showRemaining} onChange={(checked) => updateTooltipSettings({ showRemaining: checked })} />
+        <Checkbox label="Next reset" checked={provider.tooltipSettings.showNextReset} onChange={(checked) => updateTooltipSettings({ showNextReset: checked })} />
+        <Checkbox label="Source type" checked={provider.tooltipSettings.showSourceType} onChange={(checked) => updateTooltipSettings({ showSourceType: checked })} />
+        <Checkbox label="Last updated" checked={provider.tooltipSettings.showLastUpdated} onChange={(checked) => updateTooltipSettings({ showLastUpdated: checked })} />
+      </fieldset>
+
+      {provider.supportedPeriods.map((period) => (
+        <PeriodSettings key={period.id} period={period} onChange={(patch) => updatePeriod(period.id, patch)} />
+      ))}
+    </div>
+  )
+}
+
+function PeriodSettings({ period, onChange }: { period: UsagePeriod; onChange: (patch: Partial<UsagePeriod>) => void }) {
+  return (
+    <section className="period-settings">
+      <h4>{period.label} limits</h4>
+      <div className="two-column">
+        <NumberField label="Limit amount" value={period.limit} onChange={(value) => onChange({ limit: value, setupConfirmed: Boolean(value) })} />
+        <NumberField label="Used amount" value={period.used} onChange={(value) => onChange({ used: value ?? 0, setupConfirmed: true })} />
+      </div>
+      <label>
+        Reset format
+        <ResetFormatSelect
+          value={period.resetDisplaySettings.format}
+          onChange={(format) => onChange({ resetDisplaySettings: { ...period.resetDisplaySettings, format } })}
+        />
+      </label>
+      <div className="two-column">
+        <label>
+          Timezone
+          <input
+            value={period.resetDisplaySettings.timezone}
+            onChange={(event) => onChange({
+              resetDisplaySettings: { ...period.resetDisplaySettings, timezone: event.target.value },
+              resetRoutine: { ...period.resetRoutine, timezone: event.target.value },
+            })}
+          />
+        </label>
+        <label>
+          Time format
+          <select
+            value={period.resetDisplaySettings.use24HourTime ? '24' : '12'}
+            onChange={(event) => onChange({ resetDisplaySettings: { ...period.resetDisplaySettings, use24HourTime: event.target.value === '24' } })}
+          >
+            <option value="24">24-hour</option>
+            <option value="12">12-hour</option>
+          </select>
+        </label>
+      </div>
+      <label>
+        Reset routine
+        <select
+          value={period.resetRoutine.type}
+          onChange={(event) => onChange({ resetRoutine: { ...period.resetRoutine, type: event.target.value as ResetRoutineType } })}
+        >
+          {RESET_ROUTINE_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>{option.label}</option>
+          ))}
+        </select>
+      </label>
+      <div className="two-column">
+        <NumberField
+          label="Reset hour"
+          value={period.resetRoutine.resetHour}
+          onChange={(value) => onChange({ resetRoutine: { ...period.resetRoutine, resetHour: value } })}
+        />
+        <NumberField
+          label="Reset minute"
+          value={period.resetRoutine.resetMinute}
+          onChange={(value) => onChange({ resetRoutine: { ...period.resetRoutine, resetMinute: value } })}
+        />
+        <NumberField
+          label="Weekly reset day"
+          value={period.resetRoutine.weeklyResetDay}
+          onChange={(value) => onChange({ resetRoutine: { ...period.resetRoutine, weeklyResetDay: value } })}
+        />
+        <NumberField
+          label="Monthly reset day"
+          value={period.resetRoutine.monthlyResetDay}
+          onChange={(value) => onChange({ resetRoutine: { ...period.resetRoutine, monthlyResetDay: value } })}
+        />
+        <NumberField
+          label="Custom interval hours"
+          value={period.resetRoutine.intervalHours}
+          onChange={(value) => onChange({ resetRoutine: { ...period.resetRoutine, intervalHours: value } })}
+        />
+        <label>
+          Custom reset datetime
+          <input
+            type="datetime-local"
+            value={toDatetimeLocal(period.resetRoutine.customResetAt)}
+            onChange={(event) => onChange({
+              resetRoutine: {
+                ...period.resetRoutine,
+                customResetAt: event.target.value ? new Date(event.target.value).toISOString() : undefined,
+              },
+              nextResetAt: event.target.value ? new Date(event.target.value).toISOString() : period.nextResetAt,
+            })}
+          />
+        </label>
+      </div>
+    </section>
+  )
+}
+
+function AddUsageModal({
+  providers,
+  defaultProviderId,
+  onClose,
+  onAdd,
+}: {
+  providers: AiProvider[]
+  defaultProviderId?: string
+  onClose: () => void
+  onAdd: (providerId: string, periodId: string, amount: number, note?: string) => void
+}) {
+  const [providerId, setProviderId] = useState(defaultProviderId ?? providers[0]?.id ?? '')
+  const provider = providers.find((item) => item.id === providerId) ?? providers[0]
+  const [periodId, setPeriodId] = useState(provider?.selectedDisplayPeriodId ?? provider?.supportedPeriods[0]?.id ?? '')
+  const selectedPeriodId = provider?.supportedPeriods.some((period) => period.id === periodId)
+    ? periodId
+    : provider?.selectedDisplayPeriodId ?? provider?.supportedPeriods[0]?.id ?? ''
+  const [amount, setAmount] = useState<number | undefined>()
+  const [note, setNote] = useState('')
+
+  return (
+    <Modal title="Add Usage" onClose={onClose}>
+      <form
+        className="modal-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (!providerId || !selectedPeriodId || !amount) return
+          onAdd(providerId, selectedPeriodId, amount, note.trim() || undefined)
+        }}
+      >
+        <label>
+          Provider
+          <select
+            value={providerId}
+            onChange={(event) => {
+              const nextProvider = providers.find((item) => item.id === event.target.value)
+              setProviderId(event.target.value)
+              setPeriodId(nextProvider?.selectedDisplayPeriodId ?? nextProvider?.supportedPeriods[0]?.id ?? '')
+            }}
+          >
+            {providers.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}
+          </select>
+        </label>
+        <label>
+          Period
+          <select value={selectedPeriodId} onChange={(event) => setPeriodId(event.target.value)}>
+            {provider?.supportedPeriods.map((period) => <option key={period.id} value={period.id}>{period.label}</option>)}
+          </select>
+        </label>
+        <NumberField label="Amount used" value={amount} onChange={setAmount} />
+        <label>
+          Note
+          <input value={note} onChange={(event) => setNote(event.target.value)} />
+        </label>
+        <div className="modal-actions">
+          <button type="button" onClick={onClose}>Cancel</button>
+          <button type="submit">Add usage</button>
+        </div>
+      </form>
+    </Modal>
+  )
+}
+
+function SetupStep({ title, helper, children }: { title: string; helper: string; children: React.ReactNode }) {
+  return (
+    <div className="setup-step">
+      <h3>{title}</h3>
+      <p>{helper}</p>
+      <div className="settings-stack">{children}</div>
+    </div>
+  )
+}
+
+function PreviewProvider({ draft }: { draft: SetupDraft }) {
+  return (
+    <div className="preview-box">
+      <Fact label="Provider" value={draft.displayName} />
+      <Fact label="Tray display" value={`${draft.selectedDisplayPeriodId} remaining`} />
+      <Fact label="5h limit" value={formatAmount(draft.fiveHourLimit)} />
+      <Fact label="Weekly limit" value={formatAmount(draft.weeklyLimit)} />
+      <Fact label="Source" value={getSourceBadgeMeta(draft.sourceType).label} />
+    </div>
+  )
+}
+
+function ProgressBar({ percentage }: { percentage?: number }) {
+  return (
+    <div className="progress-track">
+      <span style={{ width: `${percentage ?? 0}%` }} />
+    </div>
+  )
+}
+
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </>
+  )
+}
+
+function NumberField({ label, value, onChange }: { label: string; value?: number; onChange: (value: number | undefined) => void }) {
+  return (
+    <label>
+      {label}
+      <input
+        type="number"
+        min="0"
+        value={value ?? ''}
+        onChange={(event) => onChange(event.target.value === '' ? undefined : Number(event.target.value))}
+      />
+    </label>
+  )
+}
+
+function ResetFormatSelect({ value, onChange }: { value: ResetDisplayFormat; onChange: (value: ResetDisplayFormat) => void }) {
+  return (
+    <select value={value} onChange={(event) => onChange(event.target.value as ResetDisplayFormat)}>
+      {RESET_FORMAT_OPTIONS.map((option) => (
+        <option key={option.value} value={option.value}>{option.label}</option>
+      ))}
+    </select>
+  )
+}
+
+function Segmented({ options, value, onChange }: { options: string[]; value: string; onChange: (value: string) => void }) {
+  return (
+    <div className="segmented">
+      {options.map((option) => (
+        <button key={option} type="button" className={option === value ? 'active' : ''} onClick={() => onChange(option)}>
+          {option}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function Checkbox({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <label className="checkbox-row">
+      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      {label}
+    </label>
+  )
+}
+
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal-panel" role="dialog" aria-modal="true" aria-label={title}>
@@ -599,103 +951,204 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
   )
 }
 
-function createProviderFromDraft(draft: ProviderDraft): Provider {
-  return createProvider(
-    draft.name,
-    draft.plan,
-    draft.source,
-    draft.limitUnit,
-    draft.maxQuota,
-    draft.usedQuota,
-    draft.resetFrequency,
-    draft.timezone,
-    draft.warningThresholdPercent,
-    draft.customHours,
-  )
+function getPeriodStateText(period: UsagePeriod) {
+  if (!period.limit) {
+    return {
+      title: 'Setup required',
+      body: 'Choose provider and limits to start tracking.',
+    }
+  }
+  if (period.sourceType === 'manual') {
+    return {
+      title: 'Manual tracking',
+      body: 'Update usage when you use your AI subscription.',
+    }
+  }
+  if (period.sourceType === 'estimated') {
+    return {
+      title: 'Estimated',
+      body: 'Usage is estimated from activity this app can see.',
+    }
+  }
+  if (period.sourceType === 'local') {
+    return {
+      title: 'Local sync',
+      body: 'Usage is synced from a supported local provider session.',
+    }
+  }
+  if (period.sourceType === 'official') {
+    return {
+      title: 'Official',
+      body: 'Usage is synced from an official provider API.',
+    }
+  }
+  return {
+    title: 'Official tracking unavailable',
+    body: 'Use manual tracking instead.',
+  }
 }
 
-function updateProviderFromDraft(provider: Provider, draft: ProviderDraft): Provider {
-  const model = provider.models[0]
-  const limit = model?.limits[0]
-  const resetRule = createResetRule(draft.resetFrequency, draft.timezone, {
-    customHours: draft.customHours,
-    weeklyResetDay: draft.weeklyResetDay,
-    monthlyResetDay: draft.monthlyResetDay,
-  })
+function toggleValue<T>(items: T[], value: T, enabled: boolean) {
+  if (enabled && !items.includes(value)) return [...items, value]
+  if (!enabled) return items.filter((item) => item !== value)
+  return items
+}
+
+function toDatetimeLocal(value?: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+  return local.toISOString().slice(0, 16)
+}
+
+function ensureNotificationRules(existing: AppState['notificationRules'], provider: AiProvider) {
+  const next = [...existing]
+  for (const period of provider.supportedPeriods) {
+    if (next.some((rule) => rule.providerId === provider.id && rule.periodId === period.id)) continue
+    next.push({
+      id: crypto.randomUUID(),
+      providerId: provider.id,
+      periodId: period.id,
+      enabled: true,
+      thresholdPercent: provider.warningThresholdPercent,
+      cooldownMinutes: 180,
+    })
+  }
+  return next
+}
+
+function migrateState(saved: AppState | null): AppState {
+  if (!saved || !Array.isArray(saved.providers)) return createInitialState()
+  if (saved.providers.some((provider) => !('supportedPeriods' in provider))) {
+    return createInitialState()
+  }
+  const initial = createInitialState()
+  return {
+    ...initial,
+    ...saved,
+    providers: saved.providers.map(enforceSupportedSources),
+    settings: {
+      ...initial.settings,
+      ...saved.settings,
+    },
+  }
+}
+
+function enforceSupportedSources(provider: AiProvider): AiProvider {
+  if (provider.sourceType !== 'official' && provider.supportedPeriods.every((period) => period.sourceType !== 'official')) {
+    return provider
+  }
 
   return {
     ...provider,
-    name: draft.name,
-    plan: draft.plan,
-    source: draft.source,
-    adapterId: draft.source === 'official' ? `${draft.name.toLowerCase()}-api` : 'manual',
-    updatedAt: new Date().toISOString(),
-    models: [
-      {
-        id: model?.id ?? crypto.randomUUID(),
-        providerId: provider.id,
-        name: model?.name ?? 'Default',
-        enabled: true,
-        limits: [
-          {
-            id: limit?.id ?? crypto.randomUUID(),
-            providerId: provider.id,
-            modelId: model?.id,
-            unit: draft.limitUnit,
-            maxQuota: draft.maxQuota,
-            usedQuota: Math.min(draft.usedQuota, draft.maxQuota),
-            resetRule,
-            warningThresholdPercent: draft.warningThresholdPercent,
-            source: draft.source,
-          },
-        ],
-      },
-    ],
+    sourceType: provider.sourceType === 'official' ? 'manual' : provider.sourceType,
+    supportedPeriods: provider.supportedPeriods.map((period) => ({
+      ...period,
+      sourceType: period.sourceType === 'official' ? 'manual' : period.sourceType,
+    })),
+    notes: 'Official/local subscription status is not available in this build. Manual setup is used.',
   }
 }
 
-function providerToDraft(provider: Provider): ProviderDraft {
-  const limit = provider.models[0]?.limits[0]
-  return {
-    id: provider.id,
-    name: provider.name,
-    plan: provider.plan,
-    source: provider.source,
-    limitUnit: limit?.unit ?? 'messages',
-    maxQuota: limit?.maxQuota ?? 100,
-    usedQuota: limit?.usedQuota ?? 0,
-    resetFrequency: limit?.resetRule.frequency ?? 'daily',
-    customHours: limit?.resetRule.customHours,
-    timezone: limit?.resetRule.timezone ?? getDefaultTimezone(),
-    weeklyResetDay: limit?.resetRule.weeklyResetDay,
-    monthlyResetDay: limit?.resetRule.monthlyResetDay,
-    warningThresholdPercent: limit?.warningThresholdPercent ?? 20,
-  }
+function getLocalSyncKinds(providers: AiProvider[]) {
+  return LOCAL_SYNC_PROVIDER_KINDS.filter((kind) =>
+    providers.some((provider) => provider.kind === kind && provider.sourceType === 'local'),
+  )
 }
 
-function resetProvider(state: AppState, providerId: string): AppState {
+function isLocalSyncProvider(provider: AiProvider) {
+  return provider.sourceType === 'local' && LOCAL_SYNC_PROVIDER_KINDS.includes(provider.kind)
+}
+
+function getLocalSyncLabel(providerKind: ProviderKind) {
+  if (providerKind === 'chatgpt_codex') return 'Codex'
+  if (providerKind === 'claude') return 'Claude'
+  if (providerKind === 'gemini') return 'Gemini'
+  return 'Local'
+}
+
+function applyLocalUsageSync(state: AppState, providerKind: ProviderKind, response: LocalUsageResponse): AppState {
+  if (response.status !== 'live' || response.windows.length === 0) {
+    return markLocalSyncFailed(state, providerKind, response.message ?? `${getLocalSyncLabel(providerKind)} usage sync is unavailable.`)
+  }
+
   return {
     ...state,
-    providers: state.providers.map((provider) =>
-      provider.id === providerId
-        ? {
-            ...provider,
-            updatedAt: new Date().toISOString(),
-            models: provider.models.map((model) => ({
-              ...model,
-              limits: model.limits.map((limit) => ({
-                ...limit,
-                usedQuota: 0,
-                resetRule: createResetRule(limit.resetRule.frequency, limit.resetRule.timezone, {
-                  customHours: limit.resetRule.customHours,
-                  weeklyResetDay: limit.resetRule.weeklyResetDay,
-                  monthlyResetDay: limit.resetRule.monthlyResetDay,
-                }),
-              })),
-            })),
-          }
-        : provider,
-    ),
+    providers: state.providers.map((provider) => {
+      if (provider.kind !== providerKind || provider.sourceType !== 'local') return provider
+      const periods = mergeLocalWindows(provider.supportedPeriods, response)
+      return {
+        ...provider,
+        sourceType: 'local',
+        supportedPeriods: periods,
+        selectedDisplayPeriodId: provider.selectedDisplayPeriodId || periods[0]?.id || response.windows[0]?.label || '5h',
+        tooltipPeriodIds: periods
+          .filter((period) => period.label === '5h' || period.label === 'daily' || period.label === 'weekly')
+          .map((period) => period.id),
+        hasCredential: true,
+        lastUpdatedAt: response.fetched_at,
+        notes: `${getLocalSyncLabel(providerKind)} local sync${response.plan_type ? ` (${response.plan_type})` : ''}.`,
+      }
+    }),
+  }
+}
+
+function markLocalSyncFailed(state: AppState, providerKind: ProviderKind, message: string): AppState {
+  const now = new Date().toISOString()
+  return {
+    ...state,
+    providers: state.providers.map((provider) => {
+      if (provider.kind !== providerKind || provider.sourceType !== 'local') return provider
+      return {
+        ...provider,
+        lastUpdatedAt: provider.lastUpdatedAt ?? now,
+        notes: `${getLocalSyncLabel(providerKind)} local sync stale: ${message}`,
+      }
+    }),
+  }
+}
+
+function mergeLocalWindows(existingPeriods: UsagePeriod[], response: LocalUsageResponse) {
+  let periods = [...existingPeriods]
+  for (const window of response.windows) {
+    if (!PERIOD_LABELS.includes(window.label)) continue
+    const existing = periods.find((period) => period.label === window.label)
+    const base = existing ?? createUsagePeriod({ label: window.label, sourceType: 'local' })
+    const next = normalizeUsagePeriod({
+      ...base,
+      sourceType: 'local',
+      limit: 100,
+      used: Math.max(0, Math.min(100, window.used_percent)),
+      nextResetAt: window.reset_at ?? base.nextResetAt,
+      setupConfirmed: true,
+    })
+
+    periods = existing
+      ? periods.map((period) => (period.id === existing.id ? next : period))
+      : [...periods, next]
+  }
+
+  const order: Record<UsagePeriodLabel, number> = {
+    '5h': 1,
+    daily: 2,
+    weekly: 3,
+    monthly: 4,
+    custom: 5,
+  }
+  return periods.sort((a, b) => order[a.label] - order[b.label])
+}
+
+async function updateTrayState(trayState: ReturnType<typeof getTrayDisplayState>) {
+  if (!isTauriRuntime()) return
+  try {
+    await invoke('update_tray_state', {
+      percentage: trayState.percentage,
+      status: trayState.status,
+      tooltip: trayState.tooltip || buildTrayTooltip(trayState.activeProvider),
+    })
+  } catch {
+    // Tray APIs are unavailable in browser preview.
   }
 }
 

@@ -1,4 +1,10 @@
-import type { ResetFrequency, ResetRule, UsageLimit } from './types'
+import type {
+  ResetDisplayFormat,
+  ResetDisplaySettings,
+  ResetRoutine,
+  UsagePeriod,
+  UsagePeriodLabel,
+} from './types'
 
 const DEFAULT_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
@@ -6,110 +12,193 @@ export function getDefaultTimezone() {
   return DEFAULT_TIMEZONE
 }
 
-export function formatCountdown(targetIso: string, now = new Date()) {
-  const target = new Date(targetIso)
-  const diffMs = Math.max(0, target.getTime() - now.getTime())
-  const totalMinutes = Math.floor(diffMs / 60000)
+export function getDefaultResetDisplayFormat(label: UsagePeriodLabel): ResetDisplayFormat {
+  if (label === '5h' || label === 'daily') return 'time_only'
+  if (label === 'weekly') return 'weekday_date'
+  if (label === 'monthly') return 'date_only'
+  return 'date_time'
+}
+
+export function createResetDisplaySettings(
+  periodId: string,
+  label: UsagePeriodLabel,
+  timezone = DEFAULT_TIMEZONE,
+): ResetDisplaySettings {
+  return {
+    periodId,
+    format: getDefaultResetDisplayFormat(label),
+    use24HourTime: true,
+    timezone,
+  }
+}
+
+export function createResetRoutine(label: UsagePeriodLabel, timezone = DEFAULT_TIMEZONE): ResetRoutine {
+  if (label === '5h') {
+    return { type: 'rolling_5h', timezone, intervalHours: 5 }
+  }
+  if (label === 'daily') {
+    return { type: 'fixed_daily', timezone, resetHour: 0, resetMinute: 0 }
+  }
+  if (label === 'weekly') {
+    return { type: 'fixed_weekly', timezone, weeklyResetDay: 1, resetHour: 0, resetMinute: 0 }
+  }
+  if (label === 'monthly') {
+    return { type: 'fixed_monthly', timezone, monthlyResetDay: 1, resetHour: 0, resetMinute: 0 }
+  }
+  return { type: 'custom_hours', timezone, intervalHours: 24 }
+}
+
+export function calculateNextResetAt(routine: ResetRoutine, from = new Date(), previousResetAt?: string) {
+  if (routine.type === 'custom_datetime') {
+    return routine.customResetAt
+  }
+
+  if (routine.type === 'rolling_5h' || routine.type === 'custom_hours') {
+    const base = previousResetAt ? new Date(previousResetAt) : from
+    const intervalHours = Math.max(1, routine.intervalHours ?? (routine.type === 'rolling_5h' ? 5 : 24))
+    let next = new Date(base.getTime() + intervalHours * 60 * 60 * 1000)
+    while (next <= from) {
+      next = new Date(next.getTime() + intervalHours * 60 * 60 * 1000)
+    }
+    return next.toISOString()
+  }
+
+  const timezone = routine.timezone || DEFAULT_TIMEZONE
+  const resetHour = clampNumber(routine.resetHour, 0, 23, 0)
+  const resetMinute = clampNumber(routine.resetMinute, 0, 59, 0)
+  const parts = getZonedParts(from, timezone)
+
+  if (routine.type === 'fixed_daily') {
+    const today = zonedDate(parts.year, parts.month, parts.day, resetHour, resetMinute, timezone)
+    return (today > from
+      ? today
+      : zonedDate(parts.year, parts.month, parts.day + 1, resetHour, resetMinute, timezone)
+    ).toISOString()
+  }
+
+  if (routine.type === 'fixed_weekly') {
+    const targetDay = clampNumber(routine.weeklyResetDay, 0, 6, 1)
+    const daysUntil = (targetDay - parts.weekday + 7) % 7
+    let candidate = zonedDate(parts.year, parts.month, parts.day + daysUntil, resetHour, resetMinute, timezone)
+    if (candidate <= from) {
+      candidate = zonedDate(parts.year, parts.month, parts.day + daysUntil + 7, resetHour, resetMinute, timezone)
+    }
+    return candidate.toISOString()
+  }
+
+  const targetDay = clampNumber(routine.monthlyResetDay, 1, 28, 1)
+  const thisMonth = zonedDate(parts.year, parts.month, targetDay, resetHour, resetMinute, timezone)
+  if (thisMonth > from) return thisMonth.toISOString()
+  return zonedDate(parts.year, parts.month + 1, targetDay, resetHour, resetMinute, timezone).toISOString()
+}
+
+export function shouldResetPeriod(period: UsagePeriod, now = new Date()) {
+  if (!period.nextResetAt) return false
+  const nextReset = new Date(period.nextResetAt)
+  return !Number.isNaN(nextReset.getTime()) && now >= nextReset
+}
+
+export function advancePeriodReset(period: UsagePeriod, now = new Date()): UsagePeriod {
+  if (!shouldResetPeriod(period, now)) return period
+
+  let previousResetAt = period.nextResetAt
+  let nextResetAt = calculateNextResetAt(period.resetRoutine, now, previousResetAt)
+  let safety = 0
+
+  while (nextResetAt && new Date(nextResetAt) <= now && safety < 400) {
+    previousResetAt = nextResetAt
+    nextResetAt = calculateNextResetAt(period.resetRoutine, now, previousResetAt)
+    safety += 1
+  }
+
+  return {
+    ...period,
+    used: 0,
+    remaining: period.limit,
+    percentageRemaining: period.limit && period.limit > 0 ? 100 : undefined,
+    nextResetAt,
+  }
+}
+
+export function formatResetDisplay({
+  nextResetAt,
+  format,
+  timezone,
+  use24HourTime,
+}: {
+  nextResetAt?: string
+  format: ResetDisplayFormat
+  timezone: string
+  use24HourTime: boolean
+  customFormat?: string
+}, now = new Date()) {
+  if (!nextResetAt) return 'Reset time not set'
+
+  const date = new Date(nextResetAt)
+  if (Number.isNaN(date.getTime())) return 'Reset time not set'
+  if (date <= now) return 'Reset due now'
+
+  if (format === 'relative_countdown') {
+    return `Reset in ${formatRelativeDuration(date, now)}`
+  }
+
+  const hour12 = !use24HourTime
+  if (format === 'time_only') {
+    return `Reset at ${new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12,
+    }).format(date)}`
+  }
+
+  if (format === 'date_only') {
+    return `Reset on ${new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    }).format(date)}`
+  }
+
+  if (format === 'weekday_date') {
+    return `Reset on ${new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      weekday: 'long',
+      month: 'short',
+      day: 'numeric',
+    }).format(date)}`
+  }
+
+  // TODO: Implement safe custom date formatting if the app adopts a vetted date library.
+  return `Reset at ${new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12,
+  }).format(date)}`
+}
+
+function formatRelativeDuration(target: Date, now: Date) {
+  const diffMs = target.getTime() - now.getTime()
+  const totalMinutes = Math.max(0, Math.floor(diffMs / 60000))
   const days = Math.floor(totalMinutes / 1440)
   const hours = Math.floor((totalMinutes % 1440) / 60)
   const minutes = totalMinutes % 60
 
+  if (totalMinutes <= 0) return 'soon'
+  if (days >= 5) return `${days} days`
   if (days > 0) return `${days}d ${hours}h`
   if (hours > 0) return `${hours}h ${minutes}m`
   return `${minutes}m`
 }
 
-export function createResetRule(
-  frequency: ResetFrequency,
-  timezone = DEFAULT_TIMEZONE,
-  options?: {
-    customHours?: number
-    weeklyResetDay?: 0 | 1 | 2 | 3 | 4 | 5 | 6
-    monthlyResetDay?: number
-  },
-  now = new Date(),
-): ResetRule {
-  const lastResetAt = now.toISOString()
-  const baseRule: ResetRule = {
-    frequency,
-    timezone,
-    lastResetAt,
-    nextResetAt: '',
-    customHours: options?.customHours,
-    weeklyResetDay: options?.weeklyResetDay,
-    monthlyResetDay: options?.monthlyResetDay,
-  }
-
-  return {
-    ...baseRule,
-    nextResetAt: getNextResetAt(baseRule, now).toISOString(),
-  }
-}
-
-export function normalizeLimitReset(limit: UsageLimit, now = new Date()): UsageLimit {
-  let nextReset = new Date(limit.resetRule.nextResetAt)
-  if (Number.isNaN(nextReset.getTime()) || nextReset <= new Date(limit.resetRule.lastResetAt)) {
-    nextReset = getNextResetAt(limit.resetRule, now)
-  }
-
-  if (now < nextReset) {
-    return {
-      ...limit,
-      resetRule: {
-        ...limit.resetRule,
-        nextResetAt: nextReset.toISOString(),
-      },
-    }
-  }
-
-  let lastReset = nextReset
-  let safety = 0
-  while (lastReset <= now && safety < 400) {
-    nextReset = getNextResetAt({ ...limit.resetRule, lastResetAt: lastReset.toISOString() }, lastReset)
-    if (nextReset <= lastReset) {
-      nextReset = new Date(lastReset.getTime() + 60 * 60 * 1000)
-    }
-    if (nextReset <= now) {
-      lastReset = nextReset
-    }
-    safety += 1
-  }
-
-  return {
-    ...limit,
-    usedQuota: 0,
-    resetRule: {
-      ...limit.resetRule,
-      lastResetAt: lastReset.toISOString(),
-      nextResetAt: nextReset.toISOString(),
-    },
-  }
-}
-
-export function getNextResetAt(rule: ResetRule, from = new Date()) {
-  if (rule.frequency === 'customHours') {
-    const hours = Math.max(1, rule.customHours ?? 24)
-    return new Date(new Date(rule.lastResetAt || from).getTime() + hours * 60 * 60 * 1000)
-  }
-
-  const parts = getZonedParts(from, rule.timezone)
-  if (rule.frequency === 'daily') {
-    const today = zonedDate(parts.year, parts.month, parts.day, 0, 0, rule.timezone)
-    const candidate = today > from ? today : zonedDate(parts.year, parts.month, parts.day + 1, 0, 0, rule.timezone)
-    return candidate
-  }
-
-  if (rule.frequency === 'weekly') {
-    const targetDay = rule.weeklyResetDay ?? 1
-    const daysUntil = (targetDay - parts.weekday + 7) % 7
-    const candidateDay = daysUntil === 0 ? parts.day + 7 : parts.day + daysUntil
-    return zonedDate(parts.year, parts.month, candidateDay, 0, 0, rule.timezone)
-  }
-
-  const day = Math.max(1, Math.min(28, rule.monthlyResetDay ?? 1))
-  const thisMonth = zonedDate(parts.year, parts.month, day, 0, 0, rule.timezone)
-  if (thisMonth > from) return thisMonth
-  return zonedDate(parts.year, parts.month + 1, day, 0, 0, rule.timezone)
+function clampNumber(value: number | undefined, min: number, max: number, fallback: number) {
+  if (value === undefined || Number.isNaN(value)) return fallback
+  return Math.max(min, Math.min(max, value))
 }
 
 function getZonedParts(date: Date, timezone: string) {

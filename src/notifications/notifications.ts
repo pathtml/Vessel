@@ -1,32 +1,43 @@
 import type { AppState } from '../domain/types'
-import { summarizeProviders } from '../domain/usage'
+import { formatResetDisplay } from '../domain/reset'
+import { getStatusForPercentage, normalizeUsagePeriod } from '../domain/usage'
 
 export async function notifyLowUsage(state: AppState, updateState: (state: AppState) => void) {
   if (!state.settings.notificationsEnabled) return
 
   const now = new Date()
-  const summaries = summarizeProviders(state, now)
   let nextState = state
 
-  for (const summary of summaries) {
-    const rule = nextState.notificationRules.find((item) => item.providerId === summary.provider.id)
-    if (!rule?.enabled) continue
-    if (summary.remainingPercent > rule.thresholdPercent) continue
+  for (const provider of state.providers) {
+    for (const period of provider.supportedPeriods) {
+      const snapshot = normalizeUsagePeriod(period)
+      if (snapshot.percentageRemaining === undefined) continue
+      if (getStatusForPercentage(snapshot.percentageRemaining) === 'green') continue
 
-    const lastNotified = rule.lastNotifiedAt ? new Date(rule.lastNotifiedAt) : null
-    const cooldownMs = rule.cooldownMinutes * 60 * 1000
-    if (lastNotified && now.getTime() - lastNotified.getTime() < cooldownMs) continue
+      const rule = nextState.notificationRules.find((item) => item.providerId === provider.id && item.periodId === period.id)
+      if (!rule?.enabled) continue
+      if (snapshot.percentageRemaining > rule.thresholdPercent) continue
 
-    await sendNotification(
-      `${summary.provider.name} usage is low`,
-      `${summary.remainingPercent}% remaining. Next reset: ${new Date(summary.nextResetAt).toLocaleString()}.`,
-    )
+      const lastNotified = rule.lastNotifiedAt ? new Date(rule.lastNotifiedAt) : null
+      const cooldownMs = rule.cooldownMinutes * 60 * 1000
+      if (lastNotified && now.getTime() - lastNotified.getTime() < cooldownMs) continue
 
-    nextState = {
-      ...nextState,
-      notificationRules: nextState.notificationRules.map((item) =>
-        item.id === rule.id ? { ...item, lastNotifiedAt: now.toISOString() } : item,
-      ),
+      await sendNotification(
+        `${provider.displayName} ${period.label} usage is low`,
+        `${snapshot.percentageRemaining}% remaining. ${formatResetDisplay({
+          nextResetAt: period.nextResetAt,
+          format: period.resetDisplaySettings.format,
+          timezone: period.resetDisplaySettings.timezone,
+          use24HourTime: period.resetDisplaySettings.use24HourTime,
+        })}.`,
+      )
+
+      nextState = {
+        ...nextState,
+        notificationRules: nextState.notificationRules.map((item) =>
+          item.id === rule.id ? { ...item, lastNotifiedAt: now.toISOString() } : item,
+        ),
+      }
     }
   }
 
@@ -42,8 +53,8 @@ async function sendNotification(title: string, body: string) {
         notification.sendNotification({ title, body })
         return
       }
-    } catch (error) {
-      console.warn('Tauri notification unavailable.', error)
+    } catch {
+      // Notification support is optional.
     }
   }
 

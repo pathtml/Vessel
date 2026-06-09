@@ -19,10 +19,11 @@ export async function createStorageDriver(): Promise<StorageDriver> {
 }
 
 class LocalStorageDriver implements StorageDriver {
-  private key = 'llm-usage-tray-state-v1'
+  private key = 'ai-usage-dock-state-v1'
+  private legacyKey = 'llm-usage-tray-state-v1'
 
   async load() {
-    const raw = localStorage.getItem(this.key)
+    const raw = localStorage.getItem(this.key) ?? localStorage.getItem(this.legacyKey)
     if (!raw) return null
 
     try {

@@ -1,58 +1,106 @@
-export type UsageSource = 'manual' | 'estimated' | 'official'
-export type LimitUnit = 'messages' | 'tokens' | 'credits' | 'requests' | 'dollars'
-export type ResetFrequency = 'daily' | 'weekly' | 'monthly' | 'customHours'
-export type ProviderStatus = 'green' | 'yellow' | 'red' | 'unknown'
-export type ProviderPlan = 'Free' | 'Plus' | 'Pro' | 'Team' | 'API' | 'Custom'
+export type UsageSourceType = 'official' | 'local' | 'manual' | 'estimated' | 'unsupported'
 
-export interface Provider {
-  id: string
-  name: string
-  plan: ProviderPlan
-  source: UsageSource
-  adapterId: string
-  models: ProviderModel[]
-  createdAt: string
-  updatedAt: string
-}
+export type UsagePeriodLabel = '5h' | 'daily' | 'weekly' | 'monthly' | 'custom'
 
-export interface ProviderModel {
-  id: string
-  providerId: string
-  name: string
-  limits: UsageLimit[]
-  enabled: boolean
-}
+export type ResetRoutineType =
+  | 'rolling_5h'
+  | 'fixed_daily'
+  | 'fixed_weekly'
+  | 'fixed_monthly'
+  | 'custom_hours'
+  | 'custom_datetime'
 
-export interface UsageLimit {
-  id: string
-  providerId: string
-  modelId?: string
-  unit: LimitUnit
-  maxQuota: number
-  usedQuota: number
-  resetRule: ResetRule
-  warningThresholdPercent: number
-  source: UsageSource
-}
+export type ResetDisplayFormat =
+  | 'relative_countdown'
+  | 'time_only'
+  | 'date_only'
+  | 'date_time'
+  | 'weekday_date'
+  | 'custom'
 
-export interface ResetRule {
-  frequency: ResetFrequency
-  customHours?: number
+export type ProviderStatus = 'green' | 'yellow' | 'red' | 'neutral'
+
+export type ProviderKind =
+  | 'chatgpt'
+  | 'chatgpt_codex'
+  | 'claude'
+  | 'gemini'
+  | 'perplexity'
+  | 'cursor'
+  | 'github_copilot'
+  | 'openai_api'
+  | 'claude_api'
+  | 'custom'
+
+export interface ResetRoutine {
+  type: ResetRoutineType
   timezone: string
-  lastResetAt: string
-  nextResetAt: string
-  weeklyResetDay?: 0 | 1 | 2 | 3 | 4 | 5 | 6
+  intervalHours?: number
+  resetHour?: number
+  resetMinute?: number
+  weeklyResetDay?: number
   monthlyResetDay?: number
+  customResetAt?: string
+}
+
+export interface ResetDisplaySettings {
+  periodId: string
+  format: ResetDisplayFormat
+  customFormat?: string
+  use24HourTime: boolean
+  timezone: string
+}
+
+export interface UsagePeriod {
+  id: string
+  label: UsagePeriodLabel
+  limit?: number
+  used?: number
+  remaining?: number
+  percentageRemaining?: number
+  resetRoutine: ResetRoutine
+  resetDisplaySettings: ResetDisplaySettings
+  nextResetAt?: string
+  sourceType: UsageSourceType
+  setupConfirmed: boolean
+}
+
+export interface AiProvider {
+  id: string
+  name: string
+  displayName: string
+  kind: ProviderKind
+  enabled: boolean
+  active: boolean
+  sourceType: UsageSourceType
+  supportedPeriods: UsagePeriod[]
+  selectedDisplayPeriodId: string
+  tooltipPeriodIds: string[]
+  tooltipSettings: TooltipSettings
+  warningThresholdPercent: number
+  credentialKey?: string
+  hasCredential?: boolean
+  organizationId?: string
+  projectId?: string
+  workspaceId?: string
+  createdAt: string
+  lastUpdatedAt?: string
+  notes?: string
+}
+
+export interface TooltipSettings {
+  showPercentage: boolean
+  showRemaining: boolean
+  showNextReset: boolean
+  showSourceType: boolean
+  showLastUpdated: boolean
 }
 
 export interface UsageRecord {
   id: string
   providerId: string
-  modelId?: string
-  limitId: string
-  amount: number
-  unit: LimitUnit
-  source: UsageSource
+  periodId: string
+  amountUsed: number
   note?: string
   occurredAt: string
 }
@@ -60,6 +108,7 @@ export interface UsageRecord {
 export interface NotificationRule {
   id: string
   providerId: string
+  periodId: string
   enabled: boolean
   thresholdPercent: number
   cooldownMinutes: number
@@ -69,53 +118,57 @@ export interface NotificationRule {
 export interface IntegrationCredential {
   id: string
   providerId: string
-  kind: 'apiKey' | 'adminApiKey' | 'oauth'
+  kind: 'apiKey' | 'adminApiKey'
   storageKey: string
   createdAt: string
 }
 
 export interface AppSettings {
   openAtLogin: boolean
+  openDashboardOnStartup: boolean
+  startMinimizedToTray: boolean
   notificationsEnabled: boolean
   privacyNoteAccepted: boolean
+  defaultTimezone: string
 }
 
 export interface AppState {
-  providers: Provider[]
+  providers: AiProvider[]
   usageRecords: UsageRecord[]
   notificationRules: NotificationRule[]
+  credentials: IntegrationCredential[]
   settings: AppSettings
 }
 
-export interface UsageSummary {
-  provider: Provider
-  limits: LimitSummary[]
+export interface TrayDisplayState {
+  percentage?: number
   status: ProviderStatus
-  nextResetAt: string
-  remainingPercent: number
+  tooltip: string
+  activeProvider?: AiProvider
+  activePeriod?: UsagePeriod
 }
 
-export interface LimitSummary {
-  limit: UsageLimit
-  used: number
-  remaining: number
-  remainingPercent: number
-  status: ProviderStatus
-  resetCountdown: string
+export interface ProviderUsageAdapter {
+  providerId: string
+  providerName: string
+  sourceType: UsageSourceType
+
+  isConfigured(): Promise<boolean>
+  fetchUsagePeriods(): Promise<UsagePeriod[]>
+  validateCredentials?(): Promise<boolean>
 }
 
 export interface ProviderDraft {
   id?: string
+  kind: ProviderKind
   name: string
-  plan: ProviderPlan
-  source: UsageSource
-  limitUnit: LimitUnit
-  maxQuota: number
-  usedQuota: number
-  resetFrequency: ResetFrequency
-  customHours?: number
-  timezone: string
-  weeklyResetDay?: 0 | 1 | 2 | 3 | 4 | 5 | 6
-  monthlyResetDay?: number
+  displayName: string
+  sourceType: UsageSourceType
+  active: boolean
+  selectedDisplayPeriodId: string
+  tooltipPeriodIds: string[]
   warningThresholdPercent: number
+  notes?: string
+  apiKey?: string
+  periods: UsagePeriod[]
 }

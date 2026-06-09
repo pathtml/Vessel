@@ -1,36 +1,35 @@
-import type { ProviderAdapter, ProviderUsageSnapshot } from './ProviderAdapter'
+import type { ProviderUsageAdapter, UsagePeriod } from '../domain/types'
 
-class PlannedOfficialAdapter implements ProviderAdapter {
-  source = 'official' as const
-  supportsOfficialSync = true
-  id: string
-  label: string
-  private note: string
+interface OfficialAdapterOptions {
+  providerId: string
+  providerName: string
+  hasCredential?: boolean
+  lastKnownPeriods?: UsagePeriod[]
+}
 
-  constructor(id: string, label: string, note: string) {
-    this.id = id
-    this.label = label
-    this.note = note
+class PlannedOfficialUsageAdapter implements ProviderUsageAdapter {
+  providerId: string
+  providerName: string
+  sourceType = 'unsupported' as const
+
+  constructor(options: OfficialAdapterOptions) {
+    this.providerId = options.providerId
+    this.providerName = options.providerName
   }
 
-  async sync(): Promise<ProviderUsageSnapshot> {
-    return {
-      source: 'official',
-      limits: [],
-      fetchedAt: new Date().toISOString(),
-      note: this.note,
-    }
+  async isConfigured() {
+    return false
+  }
+
+  async validateCredentials() {
+    return false
+  }
+
+  async fetchUsagePeriods() {
+    return []
   }
 }
 
-export const OpenAIApiUsageAdapter = new PlannedOfficialAdapter(
-  'openai-api',
-  'OpenAI API usage',
-  'Planned integration: OpenAI organization usage/cost APIs and API rate-limit headers.',
-)
+export class OpenAIApiUsageAdapter extends PlannedOfficialUsageAdapter {}
 
-export const ClaudeApiUsageAdapter = new PlannedOfficialAdapter(
-  'claude-api',
-  'Anthropic API usage',
-  'Planned integration: Anthropic Admin usage reports for API usage, not Claude.ai consumer quota.',
-)
+export class ClaudeApiUsageAdapter extends PlannedOfficialUsageAdapter {}
